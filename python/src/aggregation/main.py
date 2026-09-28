@@ -24,31 +24,35 @@ class AggregationFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.fruit_top = {}
+        self.eof = {}
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Processing data message from client {client_id}")
         fruits = self.fruit_top.setdefault(client_id, [])
         for i in range(len(fruits)):
-            if self.fruit_top[client_id][i].fruit == fruit:
-                self.fruit_top[client_id][i] = self.fruit_top[client_id][i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
+            if fruits[i].fruit == fruit:
+                updated = fruits.pop(i) + fruit_item.FruitItem(fruit, amount)
+                bisect.insort(fruits, updated)
                 return
-        
-        bisect.insort(self.fruit_top[client_id], fruit_item.FruitItem(fruit, amount))
+
+        bisect.insort(fruits, fruit_item.FruitItem(fruit, amount))
 
     def _process_eof(self, client_id):
         logging.info("Received EOF")
-        fruit_chunk = list(self.fruit_top[client_id][-TOP_SIZE:])
-        fruit_chunk.reverse()
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
+        self.eof[client_id] = self.eof.get(client_id, 0) + 1
+
+        if self.eof[client_id] == SUM_AMOUNT:
+            del self.eof[client_id]
+            fruits = self.fruit_top.pop(client_id, [])
+            fruit_chunk = list(fruits[-TOP_SIZE:])
+            fruit_chunk.reverse()
+            fruit_top = list(
+                map(
+                    lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
+                    fruit_chunk,
+                )
             )
-        )
-        self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
-        del self.fruit_top[client_id]
+            self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")

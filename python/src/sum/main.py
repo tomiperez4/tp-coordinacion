@@ -24,18 +24,68 @@ class SumFilter:
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
             self.data_output_exchanges.append(data_output_exchange)
-        self.amount_by_client = {}
+
+        self.control_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE]
+        )
+
+        self.control_consume = middleware.MessageMiddlewareExchangeRabbitMQ(
+                    MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE]
+                )
+        
+        self.amount_by_client = {} # Amount of fruits received from each client
+        self.processed = {} # Amount of MESSAGES processed from each client
+        self.closing = {} # Indicates if EOF from certain client has been received
+        self.count_by_client = {} # client_id: {sum_id: count}
+        self.lock = threading.Lock()
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data")
-        fruits = self.amount_by_client.setdefault(client_id, {})
-        fruits[fruit] = fruits.get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
 
-    def _process_eof(self, client_id):
-        logging.info(f"Broadcasting data messages")
-        for final_fruit_item in self.amount_by_client[client_id].values():
+        with self.lock:
+            fruits = self.amount_by_client.setdefault(client_id, {})
+            self.processed[client_id] = self.processed.get(client_id, 0) + 1
+
+            fruits[fruit] = fruits.get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, int(amount))
+
+            processed = self.processed[client_id]
+            total = self.closing.get(client_id)
+
+        if total is not None:
+            message = message_protocol.internal.serialize(
+                [client_id, ID, processed, total]
+            )
+            self.control_publisher.send(message)
+
+    def _process_eof(self, client_id, total):
+        with self.lock:
+            processed = self.processed.get(client_id, 0)
+            self.closing[client_id] = total
+
+        self.control_publisher.send(
+            message_protocol.internal.serialize(
+                [client_id, ID, processed, total]
+            )
+        )
+
+    def process_data_messsage(self, message, ack, nack):
+        fields = message_protocol.internal.deserialize(message)
+        if len(fields) == 3:
+            self._process_data(*fields)
+        else:
+            self._process_eof(*fields)
+        ack()
+
+    def _send_eof_to_aggregator(self, client_id):
+        with self.lock:
+            fruits = self.amount_by_client.pop(client_id, {})
+            self.processed.pop(client_id, None)
+            self.closing.pop(client_id, None)
+        self.count_by_client.pop(client_id, None)
+
+        for final_fruit_item in fruits.values():
             for data_output_exchange in self.data_output_exchanges:
                 data_output_exchange.send(
                     message_protocol.internal.serialize(
@@ -47,17 +97,41 @@ class SumFilter:
         for data_output_exchange in self.data_output_exchanges:
             data_output_exchange.send(message_protocol.internal.serialize([client_id]))
 
+    def process_control_message(self, message, ack, nack):
+        logging.info(f"Control message")
 
-    def process_data_messsage(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 3:
-            self._process_data(*fields)
-        else:
-            self._process_eof(*fields)
+        client_id, sum_id, count, total = fields
+
+        sum_count = self.count_by_client.setdefault(client_id, {})
+        sum_count[sum_id] = max(sum_count.get(sum_id, 0), count)
+
+        with self.lock:
+            first_time = client_id not in self.closing
+            if first_time:
+                self.closing[client_id] = total
+            own_count = self.processed.get(client_id, 0)
+
+        if first_time and own_count > 0:
+            self.control_consume.send(
+                message_protocol.internal.serialize(
+                    [client_id, ID, own_count, total]
+                )
+            )
+
+        if total == sum(sum_count.values()):
+            self._send_eof_to_aggregator(client_id)
+
         ack()
 
     def start(self):
+        t_control = threading.Thread(target=self.start_control_thread)
+        t_control.start()
         self.input_queue.start_consuming(self.process_data_messsage)
+        t_control.join()
+
+    def start_control_thread(self):
+        self.control_consume.start_consuming(self.process_control_message)
 
 def main():
     logging.basicConfig(level=logging.INFO)
