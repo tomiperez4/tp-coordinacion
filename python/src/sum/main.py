@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import zlib
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -102,8 +103,7 @@ class SumFilter:
     def process_control_message(self, message, ack, nack):
         logging.info(f"Control message")
 
-        fields = message_protocol.internal.deserialize(message)
-        client_id, sum_id, count, total = fields
+        client_id, sum_id, count, total = message_protocol.internal.deserialize(message)
 
         sum_count = self.count_by_client.setdefault(client_id, {})
         sum_count[sum_id] = max(sum_count.get(sum_id, 0), count)
@@ -126,14 +126,35 @@ class SumFilter:
 
         ack()
 
+    def _handle_sigterm(self):
+        self.control_consume.stop_consuming()
+        self.input_queue.stop_consuming()
+
     def start(self):
+        signal.signal(signal.SIGTERM, lambda signum, frame: self._handle_sigterm())
+        
         t_control = threading.Thread(target=self.start_control_thread)
         t_control.start()
-        self.input_queue.start_consuming(self.process_data_messsage)
-        t_control.join()
+
+        try:
+            self.input_queue.start_consuming(self.process_data_messsage)
+
+        finally:
+            self.control_consume.stop_consuming()
+            self.input_queue.close()
+            self.control_publisher.close()
+            t_control.join()
 
     def start_control_thread(self):
-        self.control_consume.start_consuming(self.process_control_message)
+        try:
+            self.control_consume.start_consuming(self.process_control_message)
+
+        finally:
+            self.input_queue.stop_consuming()
+            self.control_consume.close()
+            for exchange in self.data_output_exchanges:
+                exchange.close()
+
 
 def main():
     logging.basicConfig(level=logging.INFO)

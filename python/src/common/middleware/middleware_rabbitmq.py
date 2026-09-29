@@ -62,11 +62,13 @@ class MessageMiddlewareRabbitMQ(MessageMiddleware, ABC):
             self.consumer_tag = None
 
     def stop_consuming(self) -> None:
-        if not self.consumer_tag:
+        consumer_tag = self.consumer_tag
+        if not consumer_tag:
             return
         try:
-            self.channel.stop_consuming(self.consumer_tag)
-            self.consumer_tag = None
+            self.connection.add_callback_threadsafe(
+                lambda: self.channel.stop_consuming(consumer_tag)
+            )
         except pika.exceptions.AMQPConnectionError as e:
             raise MessageMiddlewareDisconnectedError from e
 
