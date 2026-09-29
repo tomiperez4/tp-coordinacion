@@ -1,5 +1,6 @@
 import os
 import logging
+import bisect
 
 from common import middleware, message_protocol, fruit_item
 
@@ -23,10 +24,34 @@ class JoinFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
 
+        self.client_fruit_top = {} # Maintaints global top for each client
+        self.eof = {} # Amount of EOFs received from aggregators
+
     def process_messsage(self, message, ack, nack):
-        logging.info("Received top")
-        client_fruit_top = message_protocol.internal.deserialize(message)
-        self.output_queue.send(message_protocol.internal.serialize(client_fruit_top))
+        logging.info("Received partial top")
+        client_id, partial_top = message_protocol.internal.deserialize(message)
+
+        self.client_fruit_top.setdefault(client_id, [])
+        for fruit, amount in partial_top:
+            bisect.insort(self.client_fruit_top[client_id], fruit_item.FruitItem(fruit, amount))
+
+        self.eof[client_id] = self.eof.get(client_id, 0) + 1
+
+        if self.eof[client_id] == AGGREGATION_AMOUNT:
+            self.eof.pop(client_id)
+            fruits = self.client_fruit_top.pop(client_id, [])
+            fruit_chunk = list(fruits[-TOP_SIZE:])
+            fruit_chunk.reverse()
+            fruit_top = list(
+                map(
+                    lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
+                    fruit_chunk,
+                )
+            )
+
+            self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
+
+        
         ack()
 
     def start(self):

@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import zlib
 
 from common import middleware, message_protocol, fruit_item
 
@@ -30,14 +31,14 @@ class SumFilter:
         )
 
         self.control_consume = middleware.MessageMiddlewareExchangeRabbitMQ(
-                    MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE]
-                )
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE]
+        )
         
         self.amount_by_client = {} # Amount of fruits received from each client
         self.processed = {} # Amount of MESSAGES processed from each client
         self.closing = {} # Indicates if EOF from certain client has been received
-        self.count_by_client = {} # client_id: {sum_id: count}
-        self.lock = threading.Lock()
+        self.count_by_client = {} # Takes count of all sum's processed messages
+        self.lock = threading.Lock() # Serialize access to shared data
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data")
@@ -86,12 +87,13 @@ class SumFilter:
         self.count_by_client.pop(client_id, None)
 
         for final_fruit_item in fruits.values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [client_id, final_fruit_item.fruit, final_fruit_item.amount]
-                    )
+            idx = zlib.crc32(final_fruit_item.fruit.encode()) % AGGREGATION_AMOUNT
+
+            self.data_output_exchanges[idx].send(
+                message_protocol.internal.serialize(
+                    [client_id, final_fruit_item.fruit, final_fruit_item.amount]
                 )
+            )
 
         logging.info(f"Broadcasting EOF message")
         for data_output_exchange in self.data_output_exchanges:
