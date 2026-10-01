@@ -15,6 +15,11 @@ SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
+FRUIT_ITEM_OPCODE = message_protocol.internal.Opcode.FruitItem
+EOF_OPCODE = message_protocol.internal.Opcode.EOF
+CONTROL_OPCODE = message_protocol.internal.Opcode.Control
+FRUITS_OPCODE = message_protocol.internal.Opcode.Fruits
+
 class SumFilter:
     def __init__(self):
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
@@ -42,7 +47,7 @@ class SumFilter:
         self.lock = threading.Lock() # Serialize access to shared data
 
     def _process_data(self, client_id, fruit, amount):
-        logging.info(f"Process data")
+        logging.info(f"Process data from {client_id}")
 
         with self.lock:
             fruits = self.amount_by_client.setdefault(client_id, {})
@@ -57,26 +62,27 @@ class SumFilter:
 
         if total is not None:
             message = message_protocol.internal.serialize(
-                [client_id, ID, processed, total]
+                [CONTROL_OPCODE, client_id, ID, processed, total]
             )
             self.control_publisher.send(message)
 
     def _process_eof(self, client_id, total):
+        logging.info(f"Process EOF from {client_id}")
         with self.lock:
             processed = self.processed.get(client_id, 0)
             self.closing[client_id] = total
 
         self.control_publisher.send(
             message_protocol.internal.serialize(
-                [client_id, ID, processed, total]
+                [CONTROL_OPCODE, client_id, ID, processed, total]
             )
         )
 
     def process_data_messsage(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 3:
+        opcode, fields = message_protocol.internal.deserialize(message)
+        if opcode == FRUIT_ITEM_OPCODE:
             self._process_data(*fields)
-        else:
+        elif opcode == EOF_OPCODE:
             self._process_eof(*fields)
         ack()
 
@@ -92,18 +98,24 @@ class SumFilter:
 
             self.data_output_exchanges[idx].send(
                 message_protocol.internal.serialize(
-                    [client_id, final_fruit_item.fruit, final_fruit_item.amount]
+                    [FRUITS_OPCODE, client_id, ID, final_fruit_item.fruit, final_fruit_item.amount]
                 )
             )
 
-        logging.info(f"Broadcasting EOF message")
+        logging.info(f"Broadcasting EOF message from {client_id}")
         for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([client_id]))
+            data_output_exchange.send(message_protocol.internal.serialize([EOF_OPCODE, client_id, ID]))
 
     def process_control_message(self, message, ack, nack):
-        logging.info(f"Control message")
+        opcode, fields = message_protocol.internal.deserialize(message)
 
-        client_id, sum_id, count, total = message_protocol.internal.deserialize(message)
+        if opcode == CONTROL_OPCODE:
+            self._process_control(*fields)
+
+        ack()
+
+    def _process_control(self, client_id, sum_id, count, total):
+        logging.info(f"Control message")
 
         sum_count = self.count_by_client.setdefault(client_id, {})
         sum_count[sum_id] = max(sum_count.get(sum_id, 0), count)
@@ -117,14 +129,12 @@ class SumFilter:
         if first_time and own_count > 0:
             self.control_consume.send(
                 message_protocol.internal.serialize(
-                    [client_id, ID, own_count, total]
+                    [CONTROL_OPCODE, client_id, ID, own_count, total]
                 )
             )
 
         if total == sum(sum_count.values()):
             self._send_eof_to_aggregator(client_id)
-
-        ack()
 
     def _handle_sigterm(self):
         self.control_consume.stop_consuming()

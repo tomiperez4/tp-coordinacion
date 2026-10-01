@@ -14,6 +14,9 @@ AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
 
+EOF_OPCODE = message_protocol.internal.Opcode.EOF
+FRUITS_OPCODE = message_protocol.internal.Opcode.Fruits
+PARTIAL_TOP_OPCODE = message_protocol.internal.Opcode.PartialTop
 
 class AggregationFilter:
 
@@ -25,10 +28,10 @@ class AggregationFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.fruit_top = {}
-        self.eof = {}
+        self.eof = {} # Sum IDs that sent EOF for each client
 
-    def _process_data(self, client_id, fruit, amount):
-        logging.info(f"Processing data message from client {client_id}")
+    def _process_data(self, client_id, sum_id, fruit, amount):
+        logging.info(f"Processing data message from client {client_id} (sum {sum_id})")
         fruits = self.fruit_top.setdefault(client_id, [])
         for i in range(len(fruits)):
             if fruits[i].fruit == fruit:
@@ -38,11 +41,14 @@ class AggregationFilter:
 
         bisect.insort(fruits, fruit_item.FruitItem(fruit, amount))
 
-    def _process_eof(self, client_id):
-        logging.info("Received EOF")
-        self.eof[client_id] = self.eof.get(client_id, 0) + 1
+    def _process_eof(self, client_id, sum_id):
+        senders = self.eof.setdefault(client_id, set())
+        senders.add(sum_id)
+        logging.info(
+            f"Received EOF from sum {sum_id} for client {client_id} ({len(senders)}/{SUM_AMOUNT})"
+        )
 
-        if self.eof[client_id] == SUM_AMOUNT:
+        if len(senders) == SUM_AMOUNT:
             del self.eof[client_id]
             fruits = self.fruit_top.pop(client_id, [])
             fruit_chunk = list(fruits[-TOP_SIZE:])
@@ -53,14 +59,16 @@ class AggregationFilter:
                     fruit_chunk,
                 )
             )
-            self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
+            self.output_queue.send(message_protocol.internal.serialize(
+                [PARTIAL_TOP_OPCODE, client_id, ID, fruit_top]
+            ))
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 3:
+        opcode, fields = message_protocol.internal.deserialize(message)
+        if opcode == FRUITS_OPCODE:
             self._process_data(*fields)
-        else:
+        elif opcode == EOF_OPCODE:
             self._process_eof(*fields)
         ack()
 

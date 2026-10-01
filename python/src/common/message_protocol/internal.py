@@ -1,4 +1,14 @@
 import json
+from enum import IntEnum
+
+class Opcode(IntEnum):
+    FruitItem = 0
+    EOF = 1
+    FruitTop = 2
+    PartialTop = 3
+    Control = 4
+    Fruits = 5
+
 
 
 def serialize(message):
@@ -6,4 +16,5 @@ def serialize(message):
 
 
 def deserialize(message):
-    return json.loads(message.decode("utf-8"))
+    fields = json.loads(message.decode("utf-8"))
+    return fields[0], fields[1:]

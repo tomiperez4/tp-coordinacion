@@ -14,6 +14,8 @@ AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
 
+PARTIAL_TOP_OPCODE = message_protocol.internal.Opcode.PartialTop
+FRUIT_TOP_OPCODE = message_protocol.internal.Opcode.FruitTop
 
 class JoinFilter:
 
@@ -26,19 +28,31 @@ class JoinFilter:
         )
 
         self.client_fruit_top = {} # Maintaints global top for each client
-        self.eof = {} # Amount of EOFs received from aggregators
+        self.eof = {} # Aggregation IDs that sent their partial top for each client
 
     def process_messsage(self, message, ack, nack):
-        logging.info("Received partial top")
-        client_id, partial_top = message_protocol.internal.deserialize(message)
+        opcode, fields = message_protocol.internal.deserialize(message)
+
+        if opcode == PARTIAL_TOP_OPCODE:
+            self._process_partial_top(*fields)
+        
+        ack()
+
+    def _process_partial_top(self, client_id, aggregation_id, partial_top):
+        senders = self.eof.setdefault(client_id, set())
+        if aggregation_id in senders:
+            logging.info(f"Duplicated partial top from aggregation {aggregation_id} for client {client_id}")
+            return
+        senders.add(aggregation_id)
+        logging.info(
+            f"Received partial top from aggregation {aggregation_id} for client {client_id} ({len(senders)}/{AGGREGATION_AMOUNT})"
+        )
 
         self.client_fruit_top.setdefault(client_id, [])
         for fruit, amount in partial_top:
             bisect.insort(self.client_fruit_top[client_id], fruit_item.FruitItem(fruit, amount))
 
-        self.eof[client_id] = self.eof.get(client_id, 0) + 1
-
-        if self.eof[client_id] == AGGREGATION_AMOUNT:
+        if len(senders) == AGGREGATION_AMOUNT:
             self.eof.pop(client_id)
             fruits = self.client_fruit_top.pop(client_id, [])
             fruit_chunk = list(fruits[-TOP_SIZE:])
@@ -50,10 +64,10 @@ class JoinFilter:
                 )
             )
 
-            self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
-
+            self.output_queue.send(message_protocol.internal.serialize(
+                [FRUIT_TOP_OPCODE, client_id, fruit_top]
+            ))
         
-        ack()
 
     def _handle_sigterm(self):
         self.input_queue.stop_consuming()
